@@ -12,10 +12,10 @@ stop_event = threading.Event()
 ping_threads = []
 ip_list = []
 running_threads = []
-
+result_list = []
 
 def start_ping():
-    global ip_list, ping_threads, stop_event
+    global ip_list, ping_threads, stop_event, result_list
     ping_interval = get_ping_interval()  # Get the ping interval from the entry box
     output_box_text.delete("1.0", tk.END)  # Clear the output box
 
