@@ -1,129 +1,217 @@
 import tkinter as tk
+from tkinter import filedialog
+from tkinter import ttk
 import threading
-from scapy.all import ARP, Ether, srp
-import socket
 import time
-import atexit
+import ping3
+import socket
+import datetime
 
 # Global variables
 stop_event = threading.Event()
-scan_threads = []
-stop_button = None  # Initialize the stop_button widget
-def update_output_box(result_list):
-    output_box_text.config(state=tk.NORMAL)
-    output_box_text.delete("1.0", tk.END)
-    for device in result_list:
-        output_box_text.insert(tk.END, f"IP: {device['ip']} | MAC: {device['mac']} | Hostname: {device['hostname']}\n")
-    output_box_text.see(tk.END)
-    output_box_text.config(state=tk.DISABLED)
-def scan_network(target_ip, result_list, lock, timeout=5):
-    arp = ARP(pdst=target_ip)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = ether / arp
+ping_threads = []
+ip_list = []
+running_threads = []
 
-    attempts = 3  # Number of attempts
-    delay = 1  # Delay between attempts (in seconds)
 
-    for _ in range(attempts):
-        try:
-            result = srp(packet, timeout=timeout, verbose=False)[0]
-
-            devices = []
-            for sent, received in result:
-                ip_address = received.psrc
-                mac_address = received.hwsrc
-                try:
-                    hostname = socket.gethostbyaddr(ip_address)[0]
-                except socket.herror:
-                    hostname = "N/A"
-                devices.append({'ip': ip_address, 'mac': mac_address, 'hostname': hostname})
-
-            with lock:
-                result_list.extend(devices)
-                update_output_box(result_list)  # Update output box with scan results
-            break  # Stop attempting once successful scan
-        except Exception as e:
-            print(f"Error during scanning attempt: {e}")
-            time.sleep(delay)  # Introduce a delay before next attempt
-def start_scan(event=None):
-    global scan_threads
-
-    target_ip = entry_ip.get()
-    output_box_text.delete("1.0", tk.END)
+def start_ping():
+    global ip_list, ping_threads, stop_event
+    ping_interval = get_ping_interval()  # Get the ping interval from the entry box
+    output_box_text.delete("1.0", tk.END)  # Clear the output box
 
     stop_event.clear()
-    scan_threads = []
+    ping_threads = []
 
     result_list = []
     lock = threading.Lock()
 
-    scan_thread = threading.Thread(target=scan_network, args=(target_ip, result_list, lock))
-    scan_thread.start()
-    scan_threads.append(scan_thread)
+    for ip_address in ip_list:
+        ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, result_list, lock))
+        ping_thread.start()
+        ping_threads.append(ping_thread)
 
+    start_button["state"] = "disabled"
     stop_button["state"] = "normal"
 
-    # Schedule a periodic check for scan completion
-    check_scan_completion(result_list)
-def check_scan_completion(result_list):
-    if scan_threads and not scan_threads[0].is_alive():
-        stop_scan()
-        update_output_box(result_list)  # Update output box with final results
-    else:
-        output_box_text.after(1000, check_scan_completion, result_list)
-def stop_scan():
-    global stop_event
+
+def stop_ping():
+    global stop_event, running_threads
 
     stop_event.set()
 
-    for thread in scan_threads:
+    for thread in running_threads:
         if thread.is_alive():
             try:
                 thread.join()
             except Exception as e:
                 print(f"Error stopping thread: {e}")
 
-    scan_threads.clear()
+    running_threads = [thread for thread in running_threads if thread.is_alive()]
 
+    start_button["state"] = "normal"
     stop_button["state"] = "disabled"
-def stop_scan():
+
+
+def clear_output():
+    output_box_text.config(state=tk.NORMAL)
+    output_box_text.delete("1.0", tk.END)
+    output_box_text.config(state=tk.DISABLED)
+
+
+def ping_host(ip_address, ping_interval, result_list, lock):
     global stop_event
 
-    stop_event.set()
+    log_file = "ping_log.txt"  # Name of the log file
 
-    for thread in scan_threads:
-        if thread.is_alive():
-            try:
-                thread.join()
-            except Exception as e:
-                print(f"Error stopping thread: {e}")
+    while not stop_event.is_set():
+        try:
+            response_time = ping3.ping(ip_address, timeout=2)
+        except (ping3.errors.TimeoutError, OSError):
+            response_time = None
+        except Exception as e:
+            print(f"Error pinging {ip_address}: {str(e)}")
+            response_time = None
 
-    scan_threads.clear()
+        if response_time == 0:
+            response_time = None
 
-    stop_button["state"] = "disabled"
-def exit_handler():
-    stop_scan()
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        output = f"[{current_time}] Ping to {ip_address} - "
+        if response_time is not None:
+            output += f"Response time: {response_time:.5f} ms"
+        else:
+            output += "No response"
 
-atexit.register(exit_handler)
+        with lock:
+            result_list.append(output)
+
+        if write_to_log_var.get():  # Check if the "Write to Log" checkbox is checked
+            with open(log_file, 'a') as file:  # Open the file in append mode
+                file.write(output + "\n")
+
+        if not stop_event.is_set():  # Check if the thread was not stopped before updating the output
+            output_box_text.after(0, update_output_box, result_list[:])  # Pass a copy of the result_list
+
+        if ping_interval > 0:
+            time.sleep(ping_interval)
+        else:
+            break
+
+
+def update_output_box(result_list):
+    output_box_text.config(state=tk.NORMAL)
+    output_box_text.delete("1.0", tk.END)
+    for result in result_list:
+        output_box_text.insert(tk.END, result + "\n")
+    output_box_text.see(tk.END)
+    output_box_text.config(state=tk.DISABLED)
+
+
+def add_ip():
+    ip_address = entry_ip.get()
+    if ip_address and ip_address not in ip_list:  # Check if the IP address is not empty and not already in the list
+        ip_list.append(ip_address)
+        ip_listbox.insert(tk.END, ip_address)
+        entry_ip.delete(0, tk.END)
+
+
+def remove_ip():
+    try:
+        selected_index = ip_listbox.curselection()
+        if selected_index:
+            index = int(selected_index[0])
+            del ip_list[index]
+            ip_listbox.delete(selected_index)
+    except Exception as e:
+        print(f"Error while removing IP address: {e}")
+
+
+def get_ping_interval():
+    interval = entry_interval.get()
+    try:
+        return float(interval) if interval else 1
+    except ValueError:
+        return 1  # Set default interval to 1 second if an invalid value is provided
+
+
+def export_output():
+    file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+    if file_path:
+        with open(file_path, 'w') as file:
+            file.write(output_box_text.get("1.0", tk.END))
+
+
 def create_gui():
-    global entry_ip, output_box_text, stop_button
+    global entry_ip, output_box_text, ip_listbox, ip_list, entry_interval, stop_event, ping_threads, start_button, stop_button, write_to_log_var
+    ip_list = []
+    stop_event = threading.Event()
+    ping_threads = []
 
     window = tk.Tk()
-    window.title("Net Scan")
+    window.title("Ping Checker")
 
-    label_ip = tk.Label(window, text="Enter IP Range:")
+    label_ip = tk.Label(window, text="Enter IP Address or DNS:")
     label_ip.pack()
 
     entry_ip = tk.Entry(window, width=40)
     entry_ip.pack()
 
-    stop_button = tk.Button(window, text="Stop Scan", command=stop_scan, state="disabled")
-    stop_button.pack(padx=2, pady=5)
+    button_frame = tk.Frame(window)
+    button_frame.pack()
+
+    add_button = tk.Button(button_frame, text="Add", command=add_ip)
+    add_button.pack(side=tk.LEFT, padx=2, pady=5)
+
+    remove_button = tk.Button(button_frame, text="Remove", command=remove_ip)
+    remove_button.pack(side=tk.LEFT, padx=2, pady=5)
+
+    # Create a frame to hold the listbox and scrollbar
+    list_frame = tk.Frame(window)
+    list_frame.pack(fill=tk.BOTH, expand=False)
+
+    # Create an inner frame to hold the listbox and scrollbar
+    inner_frame = tk.Frame(list_frame)
+    inner_frame.pack(expand=True, padx=5, pady=5)
+
+    # Create a listbox to display the IP addresses
+    global ip_listbox
+    ip_listbox = tk.Listbox(inner_frame, selectmode=tk.SINGLE, width=40, height=5)  # Set the width to 30 characters
+    ip_listbox.pack(side=tk.LEFT, expand=False)
+
+    # Create a scrollbar for the listbox
+    scrollbar = tk.Scrollbar(inner_frame, command=ip_listbox.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # Attach the scrollbar to the listbox
+    ip_listbox.config(yscrollcommand=scrollbar.set)
+
+    label_interval = tk.Label(window, text="Enter Ping Interval (seconds):")
+    label_interval.pack()
+
+    entry_interval = tk.Entry(window)
+    entry_interval.insert(tk.END, "1")  # Default interval value
+    entry_interval.pack()
+
+    button_frame = tk.Frame(window)
+    button_frame.pack()
+
+    start_button = tk.Button(button_frame, text="Start", command=start_ping)
+    start_button.pack(side=tk.LEFT, padx=2, pady=5)
+
+    stop_button = tk.Button(button_frame, text="Stop", command=stop_ping, state="disabled")
+    stop_button.pack(side=tk.LEFT, padx=2, pady=5)
+
+    clear_button = tk.Button(button_frame, text="Clear", command=clear_output)
+    clear_button.pack(side=tk.LEFT, padx=2, pady=5)
+
+    write_to_log_var = tk.BooleanVar()
+    write_to_log_checkbox = tk.Checkbutton(window, text="Write to Log in working directory (ping_log.txt)", variable=write_to_log_var)
+    write_to_log_checkbox.pack(side="top", anchor="center", padx=5)
 
     output_box_frame = tk.Frame(window)
     output_box_frame.pack(fill=tk.BOTH, expand=True)
 
-    output_box_scrollbar = tk.Scrollbar(output_box_frame, orient=tk.VERTICAL)
+    output_box_scrollbar = ttk.Scrollbar(output_box_frame, orient=tk.VERTICAL)
     output_box_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     output_box_text = tk.Text(output_box_frame, wrap=tk.WORD, yscrollcommand=output_box_scrollbar.set, height=10)
@@ -131,14 +219,16 @@ def create_gui():
 
     output_box_scrollbar.config(command=output_box_text.yview)
 
-    try:
-        window.protocol("WM_DELETE_WINDOW", exit_handler)  # Register exit handler
-        window.bind('<Return>', start_scan)  # Bind Return key to start scan
-        window.mainloop()
-    except KeyboardInterrupt:
-        stop_scan()
-        print("Scan stopped by user.")
-        window.destroy()
+    export_button = tk.Button(window, text="Export Output", command=export_output)
+    export_button.pack(padx=2, pady=10)
+
+    window.mainloop()
+
 
 if __name__ == "__main__":
-    create_gui()
+    try:
+        create_gui()
+    except KeyboardInterrupt:
+        stop_event.set()
+        for thread in ping_threads:
+            thread.join()
