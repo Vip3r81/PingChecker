@@ -7,49 +7,45 @@ import ping3
 import socket
 import datetime
 
-class PingManager:  # Class to manage global variables
-    def __init__(self):
-        self.stop_event = threading.Event()
-        self.ping_threads = []
-        self.ip_list = []
-        self.result_list = []
-        self.lock = threading.Lock()
-
-
-ping_manager = PingManager()  # Create an instance of the class
-
-
+# Global variables
+stop_event = threading.Event()
+ping_threads = []
+ip_list = []
+running_threads = []
+result_list = []
 def start_ping():
+    global ip_list, ping_threads, stop_event, result_list
     ping_interval = get_ping_interval()  # Get the ping interval from the entry box
     output_box_text.delete("1.0", tk.END)  # Clear the output box
 
-    ping_manager.stop_event.clear()
-    ping_manager.ping_threads.clear()
-    ping_manager.result_list.clear()
+    stop_event.clear()
+    ping_threads = []
 
-    for ip_address in ping_manager.ip_list:
-        try:
-            ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, ping_manager.result_list, ping_manager.lock))
-            ping_thread.start()
-            ping_manager.ping_threads.append(ping_thread)
-        except Exception as e:
-            print(f"Error starting ping thread: {e}")
+    result_list = []
+    lock = threading.Lock()
+
+    for ip_address in ip_list:
+        ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, result_list, lock))
+        ping_thread.start()
+        ping_threads.append(ping_thread)
 
     start_button["state"] = "disabled"
     stop_button["state"] = "normal"
 
 
 def stop_ping():
-    ping_manager.stop_event.set()  # Set the stop event to signal threads to stop
+    global stop_event, running_threads
 
-    for thread in ping_manager.ping_threads:
-        if thread.is_alive():  # Check if the thread is actually alive before joining
+    stop_event.set()
+
+    for thread in running_threads:
+        if thread.is_alive():
             try:
                 thread.join()
             except Exception as e:
                 print(f"Error stopping thread: {e}")
 
-    ping_manager.ping_threads = [thread for thread in ping_manager.ping_threads if thread.is_alive()]  # Filter out stopped threads
+    running_threads = [thread for thread in running_threads if thread.is_alive()]
 
     start_button["state"] = "normal"
     stop_button["state"] = "disabled"
@@ -110,9 +106,9 @@ def update_output_box(result_list):
     output_box_text.config(state=tk.DISABLED)
 
 
-def add_ip(ip_list):
+def add_ip():
     ip_address = entry_ip.get()
-    if ip_address and ip_address not in ip_list:
+    if ip_address and ip_address not in ip_list:  # Check if the IP address is not empty and not already in the list
         ip_list.append(ip_address)
         ip_listbox.insert(tk.END, ip_address)
         entry_ip.delete(0, tk.END)
@@ -162,7 +158,7 @@ def create_gui():
     button_frame = tk.Frame(window)
     button_frame.pack()
 
-    add_button = tk.Button(button_frame, text="Add", command=lambda: add_ip(ping_manager.ip_list))
+    add_button = tk.Button(button_frame, text="Add", command=add_ip)
     add_button.pack(side=tk.LEFT, padx=2, pady=5)
 
     remove_button = tk.Button(button_frame, text="Remove", command=remove_ip)
@@ -232,6 +228,6 @@ if __name__ == "__main__":
     try:
         create_gui()
     except KeyboardInterrupt:
-        ping_manager.stop_event.set()
-        for thread in ping_manager.ping_threads:
+        stop_event.set()
+        for thread in ping_threads:
             thread.join()
