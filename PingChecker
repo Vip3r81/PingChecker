@@ -4,7 +4,6 @@ from tkinter import ttk
 import threading
 import time
 import ping3
-import socket
 import datetime
 import queue
 
@@ -36,10 +35,10 @@ def stop_ping():
     """Stops all ping threads."""
     global stop_event, ping_threads
 
-    stop_event.set()
+    stop_event.set()  # Signal the threads to stop
 
     for thread in ping_threads:
-        thread.join()
+        thread.join()  # Wait for threads to finish gracefully
 
     ping_threads = []
 
@@ -58,7 +57,7 @@ def ping_host(ip_address, ping_interval, result_queue):
 
     log_file = "ping_log.txt"
 
-    while not stop_event.is_set():
+    while not stop_event.is_set():  # Check the stop_event flag
         try:
             response_time = ping3.ping(ip_address, timeout=2)
         except (ping3.errors.TimeoutError, OSError):
@@ -116,19 +115,10 @@ def add_ip():
     """Adds an IP address or DNS name to the list."""
     ip_address = entry_ip.get()
     if ip_address and ip_address not in ip_list:
-        try:
-            socket.inet_aton(ip_address)
-            ip_list.append(ip_address)
-            ip_listbox.insert(tk.END, ip_address)
-            entry_ip.delete(0, tk.END)
-        except socket.error:
-            try:
-                socket.gethostbyname(ip_address)
-                ip_list.append(ip_address)
-                ip_listbox.insert(tk.END, ip_address)
-                entry_ip.delete(0, tk.END)
-            except socket.gaierror:
-                print(f"Invalid IP address or DNS name: {ip_address}")
+        ip_list.append(ip_address)
+        ip_listbox.insert(tk.END, ip_address)
+        entry_ip.delete(0, tk.END)
+        error_label.config(text="")  # Clear any previous error message
 
 def remove_ip():
     """Removes the selected IP address from the list."""
@@ -159,8 +149,8 @@ def export_output():
 
 def create_gui():
     """Creates the graphical user interface."""
-    global entry_ip, output_box_text, ip_listbox, entry_interval, start_button, stop_button, write_to_log_var, window
-    
+    global entry_ip, output_box_text, ip_listbox, entry_interval, start_button, stop_button, write_to_log_var, window, error_label
+
     window = tk.Tk()
     window.title("Ping Checker")
 
@@ -169,6 +159,9 @@ def create_gui():
 
     entry_ip = tk.Entry(window, width=40)
     entry_ip.pack()
+
+    error_label = tk.Label(window, text="", fg="red")  # Label for error messages
+    error_label.pack()
 
     button_frame = tk.Frame(window)
     button_frame.pack()
