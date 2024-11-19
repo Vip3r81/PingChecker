@@ -6,59 +6,57 @@ import time
 import ping3
 import socket
 import datetime
+import queue
 
 # Global variables
 stop_event = threading.Event()
 ping_threads = []
 ip_list = []
-running_threads = []
-result_list = []
+result_queue = queue.Queue()
 
 def start_ping():
-    global ip_list, ping_threads, stop_event, result_list
-    ping_interval = get_ping_interval()  # Get the ping interval from the entry box
-    output_box_text.delete("1.0", tk.END)  # Clear the output box
+    """Starts pinging the hosts in the ip_list."""
+    global ip_list, ping_threads, stop_event, result_queue
+    ping_interval = get_ping_interval()
+    output_box_text.delete("1.0", tk.END)
 
     stop_event.clear()
-    lock = threading.Lock()
+    result_queue = queue.Queue()
 
     for ip_address in ip_list:
-        ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, result_list, lock))
+        ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, result_queue))
         ping_thread.start()
         ping_threads.append(ping_thread)
 
     start_button["state"] = "disabled"
     stop_button["state"] = "normal"
-
+    window.after(100, update_output_box)
 
 def stop_ping():
-    global stop_event, running_threads
+    """Stops all ping threads."""
+    global stop_event, ping_threads
 
     stop_event.set()
 
-    for thread in running_threads:
-        if thread.is_alive():
-            try:
-                thread.join()
-            except Exception as e:
-                print(f"Error stopping thread: {e}")
+    for thread in ping_threads:
+        thread.join()
 
-    running_threads = [thread for thread in running_threads if thread.is_alive()]
+    ping_threads = []
 
     start_button["state"] = "normal"
     stop_button["state"] = "disabled"
 
-
 def clear_output():
+    """Clears the output box."""
     output_box_text.config(state=tk.NORMAL)
     output_box_text.delete("1.0", tk.END)
     output_box_text.config(state=tk.DISABLED)
 
-
-def ping_host(ip_address, ping_interval, result_list, lock):
+def ping_host(ip_address, ping_interval, result_queue):
+    """Pings a host and puts the result in the queue."""
     global stop_event
 
-    log_file = "ping_log.txt"  # Name of the log file
+    log_file = "ping_log.txt"
 
     while not stop_event.is_set():
         try:
@@ -69,8 +67,8 @@ def ping_host(ip_address, ping_interval, result_list, lock):
             print(f"Error pinging {ip_address}: {str(e)}")
             response_time = None
 
-        if response_time == 0:
-            response_time = None
+        if response_time is None or response_time == 0:
+            response_time = None  # Ensure consistent None for no response
 
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         output = f"[{current_time}] Ping to {ip_address} - "
@@ -79,40 +77,61 @@ def ping_host(ip_address, ping_interval, result_list, lock):
         else:
             output += "No response"
 
-        with lock:
-            result_list.append(output)
+        result_queue.put(output)
 
-        if write_to_log_var.get():  # Check if the "Write to Log" checkbox is checked
-            with open(log_file, 'a') as file:  # Open the file in append mode
+        if write_to_log_var.get():
+            with open(log_file, 'a') as file:
                 file.write(output + "\n")
-
-        if not stop_event.is_set():  # Check if the thread was not stopped before updating the output
-            output_box_text.after(0, update_output_box, result_list[:])  # Pass a copy of the result_list
 
         if ping_interval > 0:
             time.sleep(ping_interval)
         else:
             break
 
+def update_output_box():
+    """Updates the output box with results from the queue."""
+    global result_queue
 
-def update_output_box(result_list):
-    output_box_text.config(state=tk.NORMAL)
-    output_box_text.delete("1.0", tk.END)
-    for result in result_list:
-        output_box_text.insert(tk.END, result + "\n")
-    output_box_text.see(tk.END)
-    output_box_text.config(state=tk.DISABLED)
+    try:
+        while True:
+            result = result_queue.get_nowait()
+            output_box_text.config(state=tk.NORMAL)
 
+            if "No response" in result:
+                output_box_text.tag_config("error", foreground="red")
+                output_box_text.insert(tk.END, result + "\n", "error")
+            else:
+                output_box_text.tag_config("success", foreground="green")
+                output_box_text.insert(tk.END, result + "\n", "success")
+
+            output_box_text.see(tk.END)
+            output_box_text.config(state=tk.DISABLED)
+    except queue.Empty:
+        pass
+
+    if not stop_event.is_set():
+        window.after(100, update_output_box)
 
 def add_ip():
+    """Adds an IP address or DNS name to the list."""
     ip_address = entry_ip.get()
-    if ip_address and ip_address not in ip_list:  # Check if the IP address is not empty and not already in the list
-        ip_list.append(ip_address)
-        ip_listbox.insert(tk.END, ip_address)
-        entry_ip.delete(0, tk.END)
-
+    if ip_address and ip_address not in ip_list:
+        try:
+            socket.inet_aton(ip_address)
+            ip_list.append(ip_address)
+            ip_listbox.insert(tk.END, ip_address)
+            entry_ip.delete(0, tk.END)
+        except socket.error:
+            try:
+                socket.gethostbyname(ip_address)
+                ip_list.append(ip_address)
+                ip_listbox.insert(tk.END, ip_address)
+                entry_ip.delete(0, tk.END)
+            except socket.gaierror:
+                print(f"Invalid IP address or DNS name: {ip_address}")
 
 def remove_ip():
+    """Removes the selected IP address from the list."""
     try:
         selected_index = ip_listbox.curselection()
         if selected_index:
@@ -122,28 +141,26 @@ def remove_ip():
     except Exception as e:
         print(f"Error while removing IP address: {e}")
 
-
 def get_ping_interval():
+    """Gets the ping interval from the entry field."""
     interval = entry_interval.get()
     try:
         return float(interval) if interval else 1
     except ValueError:
-        return 1  # Set default interval to 1 second if an invalid value is provided
-
+        print("Invalid ping interval. Using default value of 1 second.")
+        return 1
 
 def export_output():
+    """Exports the output to a text file."""
     file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
     if file_path:
         with open(file_path, 'w') as file:
             file.write(output_box_text.get("1.0", tk.END))
 
-
 def create_gui():
-    global entry_ip, output_box_text, ip_listbox, ip_list, entry_interval, stop_event, ping_threads, start_button, stop_button, write_to_log_var
-    #ip_list = []
-    stop_event = threading.Event()
-    #ping_threads = []
-
+    """Creates the graphical user interface."""
+    global entry_ip, output_box_text, ip_listbox, entry_interval, start_button, stop_button, write_to_log_var, window
+    
     window = tk.Tk()
     window.title("Ping Checker")
 
@@ -162,31 +179,26 @@ def create_gui():
     remove_button = tk.Button(button_frame, text="Remove", command=remove_ip)
     remove_button.pack(side=tk.LEFT, padx=2, pady=5)
 
-    # Create a frame to hold the listbox and scrollbar
     list_frame = tk.Frame(window)
     list_frame.pack(fill=tk.BOTH, expand=False)
 
-    # Create an inner frame to hold the listbox and scrollbar
     inner_frame = tk.Frame(list_frame)
     inner_frame.pack(expand=True, padx=5, pady=5)
 
-    # Create a listbox to display the IP addresses
     global ip_listbox
-    ip_listbox = tk.Listbox(inner_frame, selectmode=tk.SINGLE, width=40, height=5)  # Set the width to 30 characters
+    ip_listbox = tk.Listbox(inner_frame, selectmode=tk.SINGLE, width=40, height=5)
     ip_listbox.pack(side=tk.LEFT, expand=False)
 
-    # Create a scrollbar for the listbox
     scrollbar = tk.Scrollbar(inner_frame, command=ip_listbox.yview)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    # Attach the scrollbar to the listbox
     ip_listbox.config(yscrollcommand=scrollbar.set)
 
     label_interval = tk.Label(window, text="Enter Ping Interval (seconds):")
     label_interval.pack()
 
     entry_interval = tk.Entry(window)
-    entry_interval.insert(tk.END, "1")  # Default interval value
+    entry_interval.insert(tk.END, "1")
     entry_interval.pack()
 
     button_frame = tk.Frame(window)
@@ -220,7 +232,6 @@ def create_gui():
     export_button.pack(padx=2, pady=10)
 
     window.mainloop()
-
 
 if __name__ == "__main__":
     try:
