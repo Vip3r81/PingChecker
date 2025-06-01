@@ -1,235 +1,354 @@
 import tkinter as tk
-from tkinter import filedialog
-from tkinter import ttk
+from tkinter import filedialog, ttk, messagebox
 import threading
 import time
 import ping3
 import datetime
 import queue
+import re
 
-# Global variables
-stop_event = threading.Event()
-ping_threads = []
-ip_list = []
-result_queue = queue.Queue()
+DEFAULT_PING_INTERVAL = 1.0  # seconds
+PING_TIMEOUT = 2  # seconds
+LOG_FILE_NAME = "ping_log.txt"
+GUI_UPDATE_INTERVAL = 100  # milliseconds
+SLEEP_CHUNK = 0.1 # seconds, for responsive stopping during sleep
 
-def start_ping():
-    """Starts pinging the hosts in the ip_list."""
-    global ip_list, ping_threads, stop_event, result_queue
-    ping_interval = get_ping_interval()
-    output_box_text.delete("1.0", tk.END)
+class PingCheckerApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Ping Checker Pro")
+        master.geometry("550x650") # Adjusted size for better layout
 
-    stop_event.clear()
-    result_queue = queue.Queue()
+        self.ip_list = []
+        self.ping_threads = []
+        self.stop_event = threading.Event()
+        self.result_queue = queue.Queue()
 
-    for ip_address in ip_list:
-        ping_thread = threading.Thread(target=ping_host, args=(ip_address, ping_interval, result_queue))
-        ping_thread.start()
-        ping_threads.append(ping_thread)
+        self.master.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-    start_button["state"] = "disabled"
-    stop_button["state"] = "normal"
-    window.after(100, update_output_box)
+        self._create_widgets()
 
-def stop_ping():
-    """Stops all ping threads."""
-    global stop_event, ping_threads
+    def _create_widgets(self):
+        # --- Input IP/Hostname Frame ---
+        input_frame = ttk.Frame(self.master, padding="10")
+        input_frame.pack(fill=tk.X)
 
-    stop_event.set()  # Signal the threads to stop
+        ttk.Label(input_frame, text="Enter IP Address or DNS:").pack(side=tk.LEFT, padx=(0, 5))
+        self.entry_ip = ttk.Entry(input_frame, width=30)
+        self.entry_ip.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,5))
+        self.entry_ip.bind("<Return>", lambda event: self._add_ip()) # Add on Enter key
 
-    for thread in ping_threads:
-        thread.join()  # Wait for threads to finish gracefully
+        self.add_button = ttk.Button(input_frame, text="Add", command=self._add_ip)
+        self.add_button.pack(side=tk.LEFT)
 
-    ping_threads = []
+        # --- IP List Frame ---
+        list_frame = ttk.LabelFrame(self.master, text="Hosts to Ping", padding="10")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-    start_button["state"] = "normal"
-    stop_button["state"] = "disabled"
+        self.ip_listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, width=40, height=8)
+        self.ip_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-def clear_output():
-    """Clears the output box."""
-    output_box_text.config(state=tk.NORMAL)
-    output_box_text.delete("1.0", tk.END)
-    output_box_text.config(state=tk.DISABLED)
+        list_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.ip_listbox.yview)
+        list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ip_listbox.config(yscrollcommand=list_scrollbar.set)
 
-def ping_host(ip_address, ping_interval, result_queue):
-    """Pings a host and puts the result in the queue."""
-    global stop_event
+        self.remove_button = ttk.Button(list_frame, text="Remove Selected", command=self._remove_ip)
+        self.remove_button.pack(pady=5, fill=tk.X, side=tk.BOTTOM)
 
-    log_file = "ping_log.txt"
 
-    while not stop_event.is_set():  # Check the stop_event flag
+        # --- Controls Frame ---
+        controls_frame = ttk.Frame(self.master, padding="10")
+        controls_frame.pack(fill=tk.X)
+
+        ttk.Label(controls_frame, text="Ping Interval (s):").pack(side=tk.LEFT, padx=(0, 5))
+        self.entry_interval_var = tk.StringVar(value=str(DEFAULT_PING_INTERVAL))
+        self.entry_interval = ttk.Entry(controls_frame, textvariable=self.entry_interval_var, width=5)
+        self.entry_interval.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.start_button = ttk.Button(controls_frame, text="Start Pinging", command=self._start_ping)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+        self.stop_button = ttk.Button(controls_frame, text="Stop Pinging", command=self._stop_ping, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        # --- Options Frame ---
+        options_frame = ttk.Frame(self.master, padding="5")
+        options_frame.pack(fill=tk.X)
+
+        self.write_to_log_var = tk.BooleanVar(value=True)
+        log_checkbox = ttk.Checkbutton(options_frame, text=f"Write to Log ({LOG_FILE_NAME})", variable=self.write_to_log_var)
+        log_checkbox.pack(side=tk.LEFT, padx=5)
+        
+        self.clear_log_on_start_var = tk.BooleanVar(value=False)
+        clear_log_checkbox = ttk.Checkbutton(options_frame, text="Clear log on start", variable=self.clear_log_on_start_var)
+        clear_log_checkbox.pack(side=tk.LEFT, padx=5)
+
+        # --- Error Label ---
+        self.error_label = ttk.Label(self.master, text="", foreground="red", wraplength=500)
+        self.error_label.pack(pady=(0,5), fill=tk.X, padx=10)
+
+
+        # --- Output Frame ---
+        output_frame = ttk.LabelFrame(self.master, text="Ping Output", padding="10")
+        output_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,5))
+
+        self.output_text = tk.Text(output_frame, wrap=tk.WORD, height=15, state=tk.DISABLED)
+        self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        output_scrollbar = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.output_text.yview)
+        output_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.output_text.config(yscrollcommand=output_scrollbar.set)
+
+        self.output_text.tag_config("success", foreground="green")
+        self.output_text.tag_config("error", foreground="red")
+        self.output_text.tag_config("info", foreground="blue")
+
+        # --- Action Buttons Frame ---
+        action_buttons_frame = ttk.Frame(self.master, padding="10")
+        action_buttons_frame.pack(fill=tk.X)
+
+        self.clear_output_button = ttk.Button(action_buttons_frame, text="Clear Output", command=self._clear_output_display)
+        self.clear_output_button.pack(side=tk.LEFT, padx=5)
+
+        self.export_button = ttk.Button(action_buttons_frame, text="Export Output", command=self._export_output)
+        self.export_button.pack(side=tk.LEFT, padx=5)
+
+
+    def _validate_ip_hostname(self, address):
+        if not address:
+            return False
+        # Simple regex for IP v4
+        ip_pattern = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
+        # Basic hostname pattern (allows for subdomains, starts/ends with alphanumeric)
+        hostname_pattern = re.compile(
+            r"^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$"
+        )
+        if ip_pattern.match(address) or hostname_pattern.match(address):
+            return True
+        return False
+
+    def _add_ip(self):
+        ip_address = self.entry_ip.get().strip()
+        if not ip_address:
+            self._show_error("IP address/DNS name cannot be empty.")
+            return
+
+        if not self._validate_ip_hostname(ip_address):
+            self._show_error(f"Invalid IP address or DNS name format: {ip_address}")
+            return
+
+        if ip_address not in self.ip_list:
+            self.ip_list.append(ip_address)
+            self.ip_listbox.insert(tk.END, ip_address)
+            self.entry_ip.delete(0, tk.END)
+            self._clear_error()
+        else:
+            self._show_error(f"{ip_address} is already in the list.")
+
+    def _remove_ip(self):
+        selected_indices = self.ip_listbox.curselection()
+        if not selected_indices:
+            self._show_error("No IP address selected to remove.")
+            return
+
+        for index in reversed(selected_indices): # Remove from end to avoid index issues
+            ip_to_remove = self.ip_listbox.get(index)
+            self.ip_listbox.delete(index)
+            if ip_to_remove in self.ip_list: # Should always be true
+                self.ip_list.remove(ip_to_remove)
+        self._clear_error()
+
+    def _get_ping_interval(self):
         try:
-            response_time = ping3.ping(ip_address, timeout=2)
-        except (ping3.errors.TimeoutError, OSError):
-            response_time = None
-        except Exception as e:
-            print(f"Error pinging {ip_address}: {str(e)}")
-            response_time = None
+            interval = float(self.entry_interval_var.get())
+            if interval <= 0:
+                self._show_error("Ping interval must be positive. Using default.")
+                return DEFAULT_PING_INTERVAL
+            self._clear_error()
+            return interval
+        except ValueError:
+            self._show_error("Invalid ping interval. Using default.")
+            return DEFAULT_PING_INTERVAL
 
-        if response_time is None or response_time == 0:
-            response_time = None  # Ensure consistent None for no response
+    def _update_output_text(self, message, tags=None):
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.insert(tk.END, message + "\n", tags)
+        self.output_text.see(tk.END)
+        self.output_text.config(state=tk.DISABLED)
 
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        output = f"[{current_time}] Ping to {ip_address} - "
-        if response_time is not None:
-            output += f"Response time: {response_time:.5f} ms"
-        else:
-            output += "No response"
+    def _show_error(self, message):
+        self.error_label.config(text=message)
 
-        result_queue.put(output)
+    def _clear_error(self):
+        self.error_label.config(text="")
 
-        if write_to_log_var.get():
-            with open(log_file, 'a') as file:
-                file.write(output + "\n")
+    def _start_ping(self):
+        if not self.ip_list:
+            self._show_error("No IP addresses to ping. Please add hosts.")
+            return
 
-        if ping_interval > 0:
-            time.sleep(ping_interval)
-        else:
-            break
+        self.ping_interval = self._get_ping_interval()
+        if self.error_label.cget("text"): # If get_ping_interval showed an error
+             # Optionally, prevent start if interval is invalid, or just proceed with default.
+             # For now, it proceeds with default if error occurred.
+             pass
 
-def update_output_box():
-    """Updates the output box with results from the queue."""
-    global result_queue
 
-    try:
-        while True:
-            result = result_queue.get_nowait()
-            output_box_text.config(state=tk.NORMAL)
+        self._update_output_text("--- Starting Pings ---", "info")
 
-            if "No response" in result:
-                output_box_text.tag_config("error", foreground="red")
-                output_box_text.insert(tk.END, result + "\n", "error")
+        if self.write_to_log_var.get() and self.clear_log_on_start_var.get():
+            try:
+                with open(LOG_FILE_NAME, 'w') as f:
+                    f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log cleared on start.\n")
+                self._update_output_text(f"Log file '{LOG_FILE_NAME}' cleared.", "info")
+            except IOError as e:
+                self._show_error(f"Error clearing log file: {e}")
+
+
+        self.stop_event.clear()
+        self.result_queue = queue.Queue() # Reinitialize queue
+
+        # Clear previous threads if any (should be empty if stop worked correctly)
+        self.ping_threads = []
+
+        for ip_address in self.ip_list:
+            thread = threading.Thread(target=self._ping_host_loop, args=(ip_address, self.ping_interval))
+            thread.daemon = True # Threads will exit when main program exits
+            thread.start()
+            self.ping_threads.append(thread)
+
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.add_button.config(state=tk.DISABLED)
+        self.remove_button.config(state=tk.DISABLED)
+        self.entry_interval.config(state=tk.DISABLED)
+
+        self.master.after(GUI_UPDATE_INTERVAL, self._process_result_queue)
+
+    def _stop_ping(self):
+        self._update_output_text("--- Stopping Pings ---", "info")
+        self.stop_event.set()
+
+        # No need to join here if threads are daemonic and _on_closing handles final join
+        # However, for immediate UI update, this is fine.
+        # for thread in self.ping_threads:
+        #     thread.join(timeout=PING_TIMEOUT + 1) # Wait a bit for threads
+
+        # Threads will stop on their own due to stop_event
+        self.ping_threads = [] # Clear the list, new threads on next start
+
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.add_button.config(state=tk.NORMAL)
+        self.remove_button.config(state=tk.NORMAL)
+        self.entry_interval.config(state=tk.NORMAL)
+        self._update_output_text("--- Pings Stopped ---", "info")
+
+
+    def _ping_host_loop(self, ip_address, ping_interval):
+        while not self.stop_event.is_set():
+            response_time_ms = None
+            status = "No response"
+            try:
+                # ping3.ping returns delay in ms if unit='ms', False on timeout, None on error
+                response_time_ms = ping3.ping(ip_address, timeout=PING_TIMEOUT, unit='ms')
+
+                if response_time_ms is False: # Timeout
+                    status = "Timeout"
+                    response_time_ms = None # Consistent handling for no valid time
+                elif response_time_ms is None: # Other errors (e.g., host unknown)
+                    status = "Host unknown or error"
+                else: # Successful ping
+                    status = f"Reply: {response_time_ms:.2f} ms"
+
+            except Exception as e: # Catch any other unexpected errors during ping
+                status = f"Error: {str(e)}"
+                response_time_ms = None # Ensure it's None
+
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            output = f"[{current_time}] {ip_address}: {status}"
+            self.result_queue.put((output, response_time_ms is not None and response_time_ms is not False)) # (message, is_success)
+
+            if self.write_to_log_var.get():
+                try:
+                    with open(LOG_FILE_NAME, 'a') as f:
+                        f.write(output + "\n")
+                except IOError as e:
+                    # Log error to GUI instead of crashing thread
+                    log_error_msg = f"[{current_time}] Error writing to log for {ip_address}: {e}"
+                    self.result_queue.put((log_error_msg, False))
+
+
+            # Responsive sleep
+            # Sleep for the interval, but check stop_event periodically
+            time_slept = 0
+            while time_slept < ping_interval and not self.stop_event.is_set():
+                sleep_duration = min(SLEEP_CHUNK, ping_interval - time_slept)
+                time.sleep(sleep_duration)
+                time_slept += sleep_duration
+            
+            if self.stop_event.is_set(): # Break outer loop if stopped during sleep
+                break
+
+
+    def _process_result_queue(self):
+        try:
+            while True: # Process all messages currently in queue
+                message, is_success = self.result_queue.get_nowait()
+                tag = "success" if is_success else "error"
+                self._update_output_text(message, tag)
+        except queue.Empty:
+            pass # No more messages
+        finally:
+            # Reschedule if pings are still supposed to be running
+            if not self.stop_event.is_set() and self.start_button["state"] == tk.DISABLED:
+                self.master.after(GUI_UPDATE_INTERVAL, self._process_result_queue)
+
+    def _clear_output_display(self):
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.delete("1.0", tk.END)
+        self.output_text.config(state=tk.DISABLED)
+        self._clear_error()
+
+    def _export_output(self):
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("Log Files", "*.log"), ("All Files", "*.*")]
+        )
+        if file_path:
+            try:
+                with open(file_path, 'w') as f:
+                    f.write(self.output_text.get("1.0", tk.END))
+                self._update_output_text(f"Output exported to {file_path}", "info")
+            except IOError as e:
+                self._show_error(f"Error exporting file: {e}")
+
+    def _on_closing(self):
+        if self.start_button["state"] == tk.DISABLED: # If pings are running
+            if messagebox.askyesno("Confirm Exit", "Pings are currently running. Are you sure you want to exit?"):
+                self.stop_event.set() # Signal threads to stop
+                # Wait for threads to finish, especially if they are writing to log or have other cleanup
+                # Making threads daemonic helps, but explicit join is safer for non-daemon tasks.
+                # Since threads are now daemonic, they will be terminated when the main thread exits.
+                # However, if you need graceful cleanup within threads (e.g., closing resources),
+                # you might still want to join them or implement a more robust shutdown.
+                # For this app, daemonic threads + stop_event is usually sufficient.
+                
+                # Give threads a moment to see the stop_event and finish current iteration
+                # This is a simplified wait; a more robust approach might involve checking thread.is_alive()
+                # for a short period or using thread.join() with a timeout if threads weren't daemonic.
+                # With daemonic threads, the main concern is unfinished I/O if they are killed abruptly.
+                # The current ping loop checks stop_event frequently, so it should stop quickly.
+                time.sleep(0.5) # Brief pause for threads to wind down
+                self.master.destroy()
             else:
-                output_box_text.tag_config("success", foreground="green")
-                output_box_text.insert(tk.END, result + "\n", "success")
+                return # Don't close
+        else:
+            self.master.destroy()
 
-            output_box_text.see(tk.END)
-            output_box_text.config(state=tk.DISABLED)
-    except queue.Empty:
-        pass
-
-    if not stop_event.is_set():
-        window.after(100, update_output_box)
-
-def add_ip():
-    """Adds an IP address or DNS name to the list."""
-    ip_address = entry_ip.get()
-    if ip_address and ip_address not in ip_list:
-        ip_list.append(ip_address)
-        ip_listbox.insert(tk.END, ip_address)
-        entry_ip.delete(0, tk.END)
-        error_label.config(text="")  # Clear any previous error message
-
-def remove_ip():
-    """Removes the selected IP address from the list."""
-    try:
-        selected_index = ip_listbox.curselection()
-        if selected_index:
-            index = int(selected_index[0])
-            del ip_list[index]
-            ip_listbox.delete(selected_index)
-    except Exception as e:
-        print(f"Error while removing IP address: {e}")
-
-def get_ping_interval():
-    """Gets the ping interval from the entry field."""
-    interval = entry_interval.get()
-    try:
-        return float(interval) if interval else 1
-    except ValueError:
-        print("Invalid ping interval. Using default value of 1 second.")
-        return 1
-
-def export_output():
-    """Exports the output to a text file."""
-    file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
-    if file_path:
-        with open(file_path, 'w') as file:
-            file.write(output_box_text.get("1.0", tk.END))
-
-def create_gui():
-    """Creates the graphical user interface."""
-    global entry_ip, output_box_text, ip_listbox, entry_interval, start_button, stop_button, write_to_log_var, window, error_label
-
-    window = tk.Tk()
-    window.title("Ping Checker")
-
-    label_ip = tk.Label(window, text="Enter IP Address or DNS:")
-    label_ip.pack()
-
-    entry_ip = tk.Entry(window, width=40)
-    entry_ip.pack()
-
-    error_label = tk.Label(window, text="", fg="red")  # Label for error messages
-    error_label.pack()
-
-    button_frame = tk.Frame(window)
-    button_frame.pack()
-
-    add_button = tk.Button(button_frame, text="Add", command=add_ip)
-    add_button.pack(side=tk.LEFT, padx=2, pady=5)
-
-    remove_button = tk.Button(button_frame, text="Remove", command=remove_ip)
-    remove_button.pack(side=tk.LEFT, padx=2, pady=5)
-
-    list_frame = tk.Frame(window)
-    list_frame.pack(fill=tk.BOTH, expand=False)
-
-    inner_frame = tk.Frame(list_frame)
-    inner_frame.pack(expand=True, padx=5, pady=5)
-
-    global ip_listbox
-    ip_listbox = tk.Listbox(inner_frame, selectmode=tk.SINGLE, width=40, height=5)
-    ip_listbox.pack(side=tk.LEFT, expand=False)
-
-    scrollbar = tk.Scrollbar(inner_frame, command=ip_listbox.yview)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-    ip_listbox.config(yscrollcommand=scrollbar.set)
-
-    label_interval = tk.Label(window, text="Enter Ping Interval (seconds):")
-    label_interval.pack()
-
-    entry_interval = tk.Entry(window)
-    entry_interval.insert(tk.END, "1")
-    entry_interval.pack()
-
-    button_frame = tk.Frame(window)
-    button_frame.pack()
-
-    start_button = tk.Button(button_frame, text="Start", command=start_ping)
-    start_button.pack(side=tk.LEFT, padx=2, pady=5)
-
-    stop_button = tk.Button(button_frame, text="Stop", command=stop_ping, state="disabled")
-    stop_button.pack(side=tk.LEFT, padx=2, pady=5)
-
-    clear_button = tk.Button(button_frame, text="Clear", command=clear_output)
-    clear_button.pack(side=tk.LEFT, padx=2, pady=5)
-
-    write_to_log_var = tk.BooleanVar()
-    write_to_log_checkbox = tk.Checkbutton(window, text="Write to Log in working directory (ping_log.txt)", variable=write_to_log_var)
-    write_to_log_checkbox.pack(side="top", anchor="center", padx=5)
-
-    output_box_frame = tk.Frame(window)
-    output_box_frame.pack(fill=tk.BOTH, expand=True)
-
-    output_box_scrollbar = ttk.Scrollbar(output_box_frame, orient=tk.VERTICAL)
-    output_box_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-    output_box_text = tk.Text(output_box_frame, wrap=tk.WORD, yscrollcommand=output_box_scrollbar.set, height=10)
-    output_box_text.pack(fill=tk.BOTH, expand=True)
-
-    output_box_scrollbar.config(command=output_box_text.yview)
-
-    export_button = tk.Button(window, text="Export Output", command=export_output)
-    export_button.pack(padx=2, pady=10)
-
-    window.mainloop()
 
 if __name__ == "__main__":
-    try:
-        create_gui()
-    except KeyboardInterrupt:
-        stop_event.set()
-        for thread in ping_threads:
-            thread.join()
+    ping3.EXCEPTIONS = True # Configure ping3 to raise exceptions for better error handling
+    root = tk.Tk()
+    app = PingCheckerApp(root)
+    root.mainloop()
